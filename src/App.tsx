@@ -1026,7 +1026,7 @@ export default function App() {
       {/* Main Split Workspace */}
       <main className="flex-1 min-h-0 flex flex-col lg:flex-row">
         {/* Left/Center Flight Viewport */}
-        <section className="relative flex-1 min-h-[360px] min-w-0 bg-[#05070B]">
+        <section className="relative flex-1 min-h-[280px] sm:min-h-[360px] min-w-0 overflow-hidden bg-[#05070B]">
           <GameCanvas
             planet={activePlanet}
             phase={marsUnlockedPopupOpen && phase === 'PLAYING' ? 'PAUSED' : phase}
@@ -1226,9 +1226,9 @@ export default function App() {
             />
           )}
 
-          {/* Mission Complete -> Planetary Propulsion Launch CTA (kept clear of bottom-right minimap) */}
+          {/* Mission Complete -> Planetary Propulsion Launch CTA (kept clear of bottom-right minimap on desktop) */}
           {phase === 'PLAYING' && currentMissionComplete && (
-            <div className="crayon-box crayon-box-slate absolute bottom-3 left-3 w-[calc(100%-224px)] max-w-md p-3.5 flex flex-col sm:flex-row items-center justify-between gap-3 shadow-2xl">
+            <div className="crayon-box crayon-box-slate absolute bottom-3 left-3 w-[calc(100%-24px)] lg:w-[calc(100%-224px)] max-w-md p-3.5 flex flex-col sm:flex-row items-center justify-between gap-3 shadow-2xl">
               <div className="min-w-0 text-center sm:text-left">
                 <div className="font-crayon text-base font-bold text-emerald-300">
                   {t.missionCompleted(activePlanetName, totalCurrentObjects)}

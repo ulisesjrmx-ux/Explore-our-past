@@ -251,7 +251,7 @@ export const ProbeMinimap: React.FC<ProbeMinimapProps> = ({
 
   return (
     <div
-      className={`pointer-events-none absolute bottom-3 right-3 crayon-box ${boxTone} p-2.5 shadow-xl`}
+      className={`hidden lg:block pointer-events-none absolute bottom-3 right-3 crayon-box ${boxTone} p-2.5 shadow-xl`}
     >
       <div className="flex items-center justify-between gap-3 mb-1 px-0.5">
         <span className="font-crayon text-sm font-bold tracking-wide text-slate-100">
