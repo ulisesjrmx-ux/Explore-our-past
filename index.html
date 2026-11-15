@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Explore our past — Misión de Rescate Lunar y Marciano</title>
+    <meta
+      name="description"
+      content="Explora La Luna y Marte en un diario espacial dibujado a crayola, pilota tu nave, rescata bitácoras históricas y escucha grabaciones espaciales."
+    />
+    <meta property="og:title" content="Explore our past — Misión de Rescate Lunar y Marciano" />
+    <meta
+      property="og:description"
+      content="Explora La Luna y Marte en un universo dibujado a crayola, rescata información de misiones espaciales y despega entre planetas."
+    />
+    <meta property="og:type" content="website" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Patrick+Hand&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap"
+      rel="stylesheet"
+    />
+  </head>
+  <body class="bg-[#07090E] text-slate-100 antialiased selection:bg-cyan-500/30 selection:text-cyan-100">
+    <!-- Hidden SVG filter for authentic wax-crayon ragged edges on UI borders/fills (never blurs button text) -->
+    <svg width="0" height="0" style="position:absolute;pointer-events:none;opacity:0" aria-hidden="true">
+      <defs>
+        <filter id="crayon-edge" x="-8%" y="-8%" width="116%" height="116%">
+          <feTurbulence
+            type="fractalNoise"
+            baseFrequency="0.065"
+            numOctaves="3"
+            seed="7"
+            result="noise"
+          />
+          <feDisplacementMap
+            in="SourceGraphic"
+            in2="noise"
+            scale="3.2"
+            xChannelSelector="R"
+            yChannelSelector="G"
+          />
+        </filter>
+      </defs>
+    </svg>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+

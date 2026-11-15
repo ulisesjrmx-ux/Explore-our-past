@@ -1,0 +1,1815 @@
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  AlertTriangle,
+  ArrowLeft,
+  BookOpen,
+  CheckCircle2,
+  Fuel,
+  Home,
+  Languages,
+  Lock,
+  Pause,
+  Play,
+  Radio,
+  Rocket,
+  RotateCcw,
+  Shield,
+  Unlock,
+  Volume2,
+  VolumeX,
+} from 'lucide-react';
+import { EarthReturnTransition } from './components/EarthReturnTransition';
+import { GameCanvas } from './components/GameCanvas';
+import { LogbookPanel } from './components/LogbookPanel';
+import { MainMenuScreen } from './components/MainMenuScreen';
+import { MissionGuideBanner } from './components/MissionGuideBanner';
+import { ProbeMinimap } from './components/ProbeMinimap';
+import { RadarPanel } from './components/RadarPanel';
+import { StoryPopupModal } from './components/StoryPopupModal';
+import {
+  FUEL_NODE_COUNT,
+  generatePlanetCrystals,
+  INITIAL_RESCUE_OBJECTS,
+  pickFuelRespawnCoords,
+  PLANETS,
+  STORY_POPUP_BY_OBJECT_ID,
+  WORLD_HEIGHT,
+  WORLD_WIDTH,
+} from './data/planets';
+import {
+  CrystalNode,
+  GamePhase,
+  Language,
+  LogEntry,
+  PlanetId,
+  RescueObject,
+  ShipState,
+  TelemetryToast,
+  TransitionState,
+} from './types/game';
+import { soundEngine } from './utils/audio';
+import {
+  getLocalizedObjectCopy,
+  getPlanetDisplayName,
+  getPlanetSectorName,
+  LANG_STORAGE_KEY,
+  UI_TEXT,
+} from './utils/i18n';
+
+const STORAGE_KEY = 'horizonte_orbital_save_v7';
+
+interface SavedState {
+  planetId: PlanetId;
+  score: number;
+  objectsByPlanet: Record<PlanetId, RescueObject[]>;
+  crystalsByPlanet: Record<PlanetId, CrystalNode[]>;
+  logEntries: LogEntry[];
+  allCompletedShown: boolean;
+  marsUnlockedShown?: boolean;
+}
+
+function createFreshState(startPlanet: PlanetId = 'moon'): SavedState {
+  return {
+    planetId: startPlanet,
+    score: 0,
+    objectsByPlanet: {
+      moon: INITIAL_RESCUE_OBJECTS.moon.map((o) => ({ ...o })),
+      mars: INITIAL_RESCUE_OBJECTS.mars.map((o) => ({ ...o })),
+    },
+    crystalsByPlanet: {
+      moon: generatePlanetCrystals('moon'),
+      mars: generatePlanetCrystals('mars'),
+    },
+    logEntries: [],
+    allCompletedShown: false,
+    marsUnlockedShown: false,
+  };
+}
+
+function loadSavedState(): SavedState | null {
+  try {
+    const rawV7 = localStorage.getItem(STORAGE_KEY);
+    if (rawV7) {
+      const parsed = JSON.parse(rawV7) as SavedState;
+      if (
+        !parsed.objectsByPlanet?.moon?.[0]?.orbitRadiusX ||
+        !parsed.objectsByPlanet?.mars?.[0]?.orbitRadiusX ||
+        parsed.objectsByPlanet.moon.length !== INITIAL_RESCUE_OBJECTS.moon.length ||
+        parsed.objectsByPlanet.mars.length !== INITIAL_RESCUE_OBJECTS.mars.length
+      ) {
+        return null;
+      }
+
+      if (parsed.crystalsByPlanet?.moon?.length !== FUEL_NODE_COUNT) {
+        parsed.crystalsByPlanet = {
+          moon: generatePlanetCrystals('moon'),
+          mars: generatePlanetCrystals('mars'),
+        };
+      }
+      (['moon', 'mars'] as PlanetId[]).forEach((pid) => {
+        parsed.objectsByPlanet[pid] = parsed.objectsByPlanet[pid].map((obj, idx) => {
+          const template = INITIAL_RESCUE_OBJECTS[pid][idx];
+          if (!template || obj.discovered) return obj;
+          return {
+            ...obj,
+            orbitRadiusX: template.orbitRadiusX,
+            orbitRadiusY: template.orbitRadiusY,
+            orbitSpeed: template.orbitSpeed,
+          };
+        });
+      });
+
+      const moonCompleted = parsed.objectsByPlanet.moon.every((o) => o.discovered);
+      if (parsed.planetId === 'mars' && !moonCompleted) {
+        parsed.planetId = 'moon';
+      }
+      if (parsed.marsUnlockedShown === undefined) {
+        parsed.marsUnlockedShown =
+          parsed.planetId === 'mars' ||
+          parsed.objectsByPlanet.mars.some((o) => o.discovered);
+      }
+
+      return parsed;
+    }
+
+    // Migrate previous v6 save seamlessly (keep Moon progress & active planet, load 9 Mars targets)
+    const rawV6 = localStorage.getItem('horizonte_orbital_save_v6');
+    if (!rawV6) return null;
+    const prev = JSON.parse(rawV6) as SavedState;
+    if (!prev.objectsByPlanet?.moon?.[0]?.orbitRadiusX) return null;
+
+    const prevMoonCompleted = prev.objectsByPlanet.moon.every((o) => o.discovered);
+
+    return {
+      planetId: prev.planetId === 'mars' && prevMoonCompleted ? 'mars' : 'moon',
+      score: prev.score ?? 0,
+      objectsByPlanet: {
+        moon: prev.objectsByPlanet.moon.map((obj, idx) => {
+          const template = INITIAL_RESCUE_OBJECTS.moon[idx];
+          if (!template || obj.discovered) return obj;
+          return {
+            ...obj,
+            orbitRadiusX: template.orbitRadiusX,
+            orbitRadiusY: template.orbitRadiusY,
+            orbitSpeed: template.orbitSpeed,
+          };
+        }),
+        mars: INITIAL_RESCUE_OBJECTS.mars.map((o) => ({ ...o })),
+      },
+      crystalsByPlanet:
+        prev.crystalsByPlanet?.moon?.length === FUEL_NODE_COUNT
+          ? prev.crystalsByPlanet
+          : {
+              moon: generatePlanetCrystals('moon'),
+              mars: generatePlanetCrystals('mars'),
+            },
+      logEntries: (prev.logEntries ?? []).filter((e) => e.planet === 'moon'),
+      allCompletedShown: false,
+    };
+  } catch {
+    return null;
+  }
+}
+
+export default function App() {
+  const saved = useMemo(() => loadSavedState(), []);
+
+  const [phase, setPhase] = useState<GamePhase>('TITLE_MENU');
+  const [selectedStartPlanet, setSelectedStartPlanet] = useState<PlanetId>(
+    saved?.planetId ?? 'moon'
+  );
+  const [planetId, setPlanetId] = useState<PlanetId>(saved?.planetId ?? 'moon');
+  const [score, setScore] = useState<number>(saved?.score ?? 0);
+  const [objectsByPlanet, setObjectsByPlanet] = useState<
+    Record<PlanetId, RescueObject[]>
+  >(() => saved?.objectsByPlanet ?? createFreshState().objectsByPlanet);
+  const [crystalsByPlanet, setCrystalsByPlanet] = useState<
+    Record<PlanetId, CrystalNode[]>
+  >(() => saved?.crystalsByPlanet ?? createFreshState().crystalsByPlanet);
+  const [logEntries, setLogEntries] = useState<LogEntry[]>(
+    () => saved?.logEntries ?? []
+  );
+  const [allCompletedShown, setAllCompletedShown] = useState<boolean>(
+    saved?.allCompletedShown ?? false
+  );
+  const [marsUnlockedShown, setMarsUnlockedShown] = useState<boolean>(
+    saved?.marsUnlockedShown ?? false
+  );
+  const [marsUnlockedPopupOpen, setMarsUnlockedPopupOpen] = useState<boolean>(false);
+
+  const [lang, setLang] = useState<Language>(() => {
+    try {
+      return localStorage.getItem(LANG_STORAGE_KEY) === 'en' ? 'en' : 'es';
+    } catch {
+      return 'es';
+    }
+  });
+  const t = UI_TEXT[lang];
+
+  const [sidebarTab, setSidebarTab] = useState<'radar' | 'logbook'>('radar');
+  const [muted, setMuted] = useState<boolean>(false);
+  const [toast, setToast] = useState<TelemetryToast | null>(null);
+  const [storyPopup, setStoryPopup] = useState<{
+    objectId: string;
+    kicker: string;
+    title: string;
+    imageUrl: string;
+  } | null>(null);
+  const returnPhaseRef = useRef<GamePhase>('PLAYING');
+  const [transitionState, setTransitionState] =
+    useState<TransitionState | null>(null);
+
+  const [shipCoords, setShipCoords] = useState<{ x: number; y: number }>({
+    x: WORLD_WIDTH / 2,
+    y: WORLD_HEIGHT / 2,
+  });
+  const [boostEnergy, setBoostEnergy] = useState<number>(100);
+  const [hull, setHull] = useState<number>(100);
+
+  const shipRef = useRef<ShipState>({
+    x: WORLD_WIDTH / 2,
+    y: WORLD_HEIGHT / 2,
+    vx: 0,
+    vy: 0,
+    angle: -Math.PI / 2,
+    thrusting: false,
+    boosting: false,
+    boostEnergy: 100,
+    hull: 100,
+    invulnTimer: 0,
+  });
+
+  const activePlanet = PLANETS[planetId];
+  const currentObjects = objectsByPlanet[planetId];
+  const currentCrystals = crystalsByPlanet[planetId];
+
+  const moonTotal = objectsByPlanet.moon.length;
+  const marsTotal = objectsByPlanet.mars.length;
+  const moonRescuedCount = objectsByPlanet.moon.filter((o) => o.discovered).length;
+  const marsUnlocked = moonRescuedCount === moonTotal;
+  const canSwitchPlanet =
+    activePlanet.targetPlanetId !== 'mars' || marsUnlocked;
+  const totalCurrentObjects = currentObjects.length;
+  const totalObjectsCount = moonTotal + marsTotal;
+  const rescuedCountCurrent = currentObjects.filter((o) => o.discovered).length;
+  const totalRescued =
+    moonRescuedCount +
+    objectsByPlanet.mars.filter((o) => o.discovered).length;
+  const currentMissionComplete = rescuedCountCurrent === totalCurrentObjects;
+  const activePlanetName = getPlanetDisplayName(planetId, lang);
+  const activePlanetSector = getPlanetSectorName(planetId, lang);
+  const targetPlanetName = getPlanetDisplayName(activePlanet.targetPlanetId, lang);
+  const activeTargetObj = currentObjects.find((o) => !o.discovered) ?? null;
+  const activeTargetName = activeTargetObj
+    ? getLocalizedObjectCopy(activeTargetObj, lang).name
+    : null;
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(LANG_STORAGE_KEY, lang);
+    } catch {
+      // Ignore storage errors
+    }
+  }, [lang]);
+
+  const handleToggleLanguage = () => {
+    setLang((prev) => (prev === 'es' ? 'en' : 'es'));
+  };
+
+  // Persist progress to localStorage
+  useEffect(() => {
+    const payload: SavedState = {
+      planetId,
+      score,
+      objectsByPlanet,
+      crystalsByPlanet,
+      logEntries,
+      allCompletedShown,
+      marsUnlockedShown,
+    };
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
+    } catch {
+      // Ignore storage quota errors
+    }
+  }, [
+    planetId,
+    score,
+    objectsByPlanet,
+    crystalsByPlanet,
+    logEntries,
+    allCompletedShown,
+    marsUnlockedShown,
+  ]);
+
+  // Auto-dismiss telemetry toast
+  useEffect(() => {
+    if (!toast) return;
+    const timer = window.setTimeout(() => setToast(null), 4800);
+    return () => window.clearTimeout(timer);
+  }, [toast]);
+
+  // Replenish one sparse fuel canister far from player when active canisters drop below 4
+  useEffect(() => {
+    if (phase !== 'PLAYING') return;
+    const activeFuelCount = currentCrystals.filter((c) => !c.collected).length;
+    if (activeFuelCount >= 4) return;
+
+    const timer = window.setTimeout(() => {
+      setCrystalsByPlanet((prev) => {
+        const list = prev[planetId];
+        const idx = list.findIndex((c) => c.collected);
+        if (idx === -1) return prev;
+        const coords = pickFuelRespawnCoords(shipRef.current.x, shipRef.current.y);
+        const updated = list.map((c, i) =>
+          i === idx ? { ...c, x: coords.x, y: coords.y, collected: false } : c
+        );
+        return { ...prev, [planetId]: updated };
+      });
+    }, 6500);
+
+    return () => window.clearTimeout(timer);
+  }, [phase, planetId, currentCrystals]);
+
+  // Trigger ALL_COMPLETED celebration once all objects across Moon & Mars are rescued
+  useEffect(() => {
+    if (
+      totalRescued === totalObjectsCount &&
+      !allCompletedShown &&
+      phase === 'PLAYING'
+    ) {
+      const timer = window.setTimeout(() => {
+        soundEngine.playArrivalChime();
+        setAllCompletedShown(true);
+        setPhase('ALL_COMPLETED');
+      }, 750);
+      return () => window.clearTimeout(timer);
+    }
+  }, [totalRescued, totalObjectsCount, allCompletedShown, phase]);
+
+  // Show crayon popup announcing Mars is unlocked once all 4 Moon objectives are done
+  useEffect(() => {
+    if (
+      marsUnlocked &&
+      !marsUnlockedShown &&
+      planetId === 'moon' &&
+      phase === 'PLAYING'
+    ) {
+      const timer = window.setTimeout(() => {
+        shipRef.current.vx = 0;
+        shipRef.current.vy = 0;
+        shipRef.current.thrusting = false;
+        shipRef.current.boosting = false;
+        soundEngine.playArrivalChime();
+        setMarsUnlockedShown(true);
+        setMarsUnlockedPopupOpen(true);
+      }, 320);
+      return () => window.clearTimeout(timer);
+    }
+  }, [marsUnlocked, marsUnlockedShown, planetId, phase]);
+
+  // Start looping background soundtrack upon first user interaction (respecting browser autoplay rules)
+  useEffect(() => {
+    const unlockMusic = () => {
+      soundEngine.ensureMusicPlaying();
+    };
+    window.addEventListener('pointerdown', unlockMusic, { passive: true });
+    window.addEventListener('keydown', unlockMusic, { passive: true });
+    return () => {
+      window.removeEventListener('pointerdown', unlockMusic);
+      window.removeEventListener('keydown', unlockMusic);
+    };
+  }, []);
+
+  // Gently duck music while paused or reading archival story pages
+  useEffect(() => {
+    soundEngine.setMusicDucked(phase === 'PAUSED' || phase === 'STORY_POPUP');
+  }, [phase]);
+
+  const handleToggleMute = () => {
+    const next = !muted;
+    soundEngine.muted = next;
+    if (!next) {
+      soundEngine.ensureMusicPlaying();
+    }
+    setMuted(next);
+  };
+
+  const handleStartMission = (chosenPlanet?: PlanetId) => {
+    soundEngine.ensureMusicPlaying();
+    const candidate = chosenPlanet ?? selectedStartPlanet;
+    const startPlanet: PlanetId =
+      candidate === 'mars' && marsUnlocked ? 'mars' : 'moon';
+    setSelectedStartPlanet(startPlanet);
+    setPlanetId(startPlanet);
+    setMarsUnlockedPopupOpen(false);
+    setToast(null);
+    setStoryPopup(null);
+    setTransitionState(null);
+    shipRef.current = {
+      x: WORLD_WIDTH / 2,
+      y: WORLD_HEIGHT / 2,
+      vx: 0,
+      vy: 0,
+      angle: -Math.PI / 2,
+      thrusting: false,
+      boosting: false,
+      boostEnergy: 100,
+      hull: 100,
+      invulnTimer: 1.0,
+    };
+    setShipCoords({ x: WORLD_WIDTH / 2, y: WORLD_HEIGHT / 2 });
+    setBoostEnergy(100);
+    setHull(100);
+    setPhase('PLAYING');
+  };
+
+  const handleBackToMenu = () => {
+    shipRef.current.vx = 0;
+    shipRef.current.vy = 0;
+    shipRef.current.thrusting = false;
+    shipRef.current.boosting = false;
+    soundEngine.setMusicDucked(false, false);
+    setMarsUnlockedPopupOpen(false);
+    setToast(null);
+    setStoryPopup(null);
+    setTransitionState(null);
+    setSidebarTab('radar');
+    setPhase('TITLE_MENU');
+  };
+
+  const handleResetMission = () => {
+    localStorage.removeItem(STORAGE_KEY);
+    const fresh = createFreshState('moon');
+    setSelectedStartPlanet('moon');
+    setPlanetId('moon');
+    setScore(0);
+    setObjectsByPlanet(fresh.objectsByPlanet);
+    setCrystalsByPlanet(fresh.crystalsByPlanet);
+    setLogEntries([]);
+    setAllCompletedShown(false);
+    setMarsUnlockedShown(false);
+    setMarsUnlockedPopupOpen(false);
+    setToast(null);
+    setStoryPopup(null);
+    setTransitionState(null);
+    setSidebarTab('radar');
+    shipRef.current = {
+      x: WORLD_WIDTH / 2,
+      y: WORLD_HEIGHT / 2,
+      vx: 0,
+      vy: 0,
+      angle: -Math.PI / 2,
+      thrusting: false,
+      boosting: false,
+      boostEnergy: 100,
+      hull: 100,
+      invulnTimer: 0,
+    };
+    setHull(100);
+    setPhase('MENU');
+  };
+
+  const handleRepairAndRespawn = () => {
+    // Also guarantee at least 5 active fuel canisters on respawn so player is never stranded
+    setCrystalsByPlanet((prev) => {
+      const list = prev[planetId];
+      let activeCount = list.filter((c) => !c.collected).length;
+      if (activeCount >= 5) return prev;
+      const updated = list.map((c) => {
+        if (!c.collected || activeCount >= 5) return c;
+        activeCount += 1;
+        const coords = pickFuelRespawnCoords(WORLD_WIDTH / 2, WORLD_HEIGHT / 2);
+        return { ...c, x: coords.x, y: coords.y, collected: false };
+      });
+      return { ...prev, [planetId]: updated };
+    });
+
+    shipRef.current = {
+      x: WORLD_WIDTH / 2,
+      y: WORLD_HEIGHT / 2,
+      vx: 0,
+      vy: 0,
+      angle: -Math.PI / 2,
+      thrusting: false,
+      boosting: false,
+      boostEnergy: 100,
+      hull: 100,
+      invulnTimer: 1.6,
+    };
+    setShipCoords({ x: WORLD_WIDTH / 2, y: WORLD_HEIGHT / 2 });
+    setBoostEnergy(100);
+    setHull(100);
+    setPhase('PLAYING');
+  };
+
+  const handleTogglePause = useCallback(() => {
+    setPhase((current) => {
+      if (current === 'PLAYING') {
+        shipRef.current.thrusting = false;
+        shipRef.current.boosting = false;
+        return 'PAUSED';
+      }
+      if (current === 'PAUSED') {
+        shipRef.current.vx = 0;
+        shipRef.current.vy = 0;
+        shipRef.current.thrusting = false;
+        shipRef.current.boosting = false;
+        shipRef.current.invulnTimer = Math.max(shipRef.current.invulnTimer, 0.8);
+        setSidebarTab((tab) => (tab === 'logbook' ? 'radar' : tab));
+        return 'PLAYING';
+      }
+      return current;
+    });
+  }, []);
+
+  const handleSelectSidebarTab = useCallback(
+    (tab: 'radar' | 'logbook') => {
+      setSidebarTab(tab);
+      if (tab === 'logbook' && phase === 'PLAYING') {
+        shipRef.current.thrusting = false;
+        shipRef.current.boosting = false;
+        setPhase('PAUSED');
+      }
+    },
+    [phase]
+  );
+
+  const handleDismissMarsUnlocked = useCallback(() => {
+    shipRef.current.vx = 0;
+    shipRef.current.vy = 0;
+    shipRef.current.thrusting = false;
+    shipRef.current.boosting = false;
+    shipRef.current.invulnTimer = Math.max(shipRef.current.invulnTimer, 1.4);
+    setMarsUnlockedPopupOpen(false);
+  }, []);
+
+  // Allow keyboard P / Escape to pause or resume during active mission (or close Mars unlock popup)
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (marsUnlockedPopupOpen) {
+        if (e.code === 'Escape') {
+          e.preventDefault();
+          handleDismissMarsUnlocked();
+        }
+        return;
+      }
+      if (e.code === 'KeyP' || e.code === 'Escape') {
+        if (phase === 'PLAYING' || phase === 'PAUSED') {
+          e.preventDefault();
+          handleTogglePause();
+        }
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [phase, marsUnlockedPopupOpen, handleTogglePause, handleDismissMarsUnlocked]);
+
+  const handleContinueFromStory = () => {
+    shipRef.current.vx = 0;
+    shipRef.current.vy = 0;
+    shipRef.current.thrusting = false;
+    shipRef.current.boosting = false;
+    shipRef.current.invulnTimer = 1.6;
+    setStoryPopup(null);
+    setPhase(returnPhaseRef.current);
+  };
+
+  const handleOpenStoryFromLogbook = useCallback(
+    (objectId: string) => {
+      const story = STORY_POPUP_BY_OBJECT_ID[objectId];
+      if (!story) return;
+      if (phase !== 'STORY_POPUP') {
+        returnPhaseRef.current = phase;
+      }
+      shipRef.current.vx = 0;
+      shipRef.current.vy = 0;
+      shipRef.current.thrusting = false;
+      shipRef.current.boosting = false;
+      setStoryPopup({ objectId, ...story });
+      setPhase('STORY_POPUP');
+    },
+    [phase]
+  );
+
+  const handleCrystalCollect = useCallback(
+    (crystalId: string, value: number) => {
+      setScore((prev) => prev + value);
+      setCrystalsByPlanet((prev) => ({
+        ...prev,
+        [planetId]: prev[planetId].map((c) =>
+          c.id === crystalId ? { ...c, collected: true } : c
+        ),
+      }));
+    },
+    [planetId]
+  );
+
+  const handleObjectRescued = useCallback(
+    (
+      objectId: string,
+      nextObjectPlacement?: { id: string; orbitAngle: number; x: number; y: number }
+    ) => {
+      const targetObj = objectsByPlanet[planetId].find((o) => o.id === objectId);
+      if (!targetObj || targetObj.discovered) return;
+
+      setScore((prev) => prev + targetObj.points);
+      setObjectsByPlanet((prev) => ({
+        ...prev,
+        [planetId]: prev[planetId].map((o) => {
+          if (o.id === objectId) {
+            return { ...o, discovered: true, downloadProgress: 1 };
+          }
+          if (nextObjectPlacement && o.id === nextObjectPlacement.id) {
+            return {
+              ...o,
+              orbitAngle: nextObjectPlacement.orbitAngle,
+              x: nextObjectPlacement.x,
+              y: nextObjectPlacement.y,
+              downloadProgress: 0,
+            };
+          }
+          return o;
+        }),
+      }));
+
+      const now = new Date();
+      const timestamp = now.toLocaleTimeString('es-MX', {
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+      });
+
+      const newEntry: LogEntry = {
+        id: `log-${objectId}-${now.getTime()}`,
+        objectId: targetObj.id,
+        planet: planetId,
+        planetName: PLANETS[planetId].name,
+        objectName: targetObj.name,
+        sector: targetObj.sector,
+        coordinates: `X:${Math.round(targetObj.x)} Y:${Math.round(targetObj.y)}`,
+        frequency: targetObj.frequency,
+        transmissionTitle: targetObj.transmissionTitle,
+        transmissionSummary: targetObj.transmissionSummary,
+        telemetryReading: targetObj.telemetryReading,
+        pointsEarned: targetObj.points,
+        timestamp,
+      };
+
+      setLogEntries((prev) => [newEntry, ...prev]);
+
+      const repaired = Math.min(100, shipRef.current.hull + 25);
+      shipRef.current.hull = repaired;
+      setHull(repaired);
+
+      const localizedObj = getLocalizedObjectCopy(targetObj, lang);
+
+      setToast({
+        id: newEntry.id,
+        objectId: targetObj.id,
+        title: `${localizedObj.name} · ${UI_TEXT[lang].dataReceivedSuffix}`,
+        subtitle: localizedObj.transmissionTitle,
+        reading: localizedObj.telemetryReading,
+        points: targetObj.points,
+        planet: planetId,
+      });
+
+      const story = STORY_POPUP_BY_OBJECT_ID[targetObj.id];
+      if (story) {
+        returnPhaseRef.current = 'PLAYING';
+        shipRef.current.vx = 0;
+        shipRef.current.vy = 0;
+        shipRef.current.thrusting = false;
+        shipRef.current.boosting = false;
+        setStoryPopup({ objectId: targetObj.id, ...story });
+        setPhase('STORY_POPUP');
+      }
+    },
+    [objectsByPlanet, planetId, lang]
+  );
+
+  const handleShipDamaged = useCallback((remainingHull: number) => {
+    setHull(remainingHull);
+    if (remainingHull <= 0) {
+      setPhase('SHIP_DESTROYED');
+    }
+  }, []);
+
+  const handleOutOfFuel = useCallback(() => {
+    setPhase((current) => {
+      if (current !== 'PLAYING') return current;
+      // Full reset back to zero when running out of gas (no progress kept, no regenerate)
+      try {
+        localStorage.removeItem(STORAGE_KEY);
+      } catch {
+        // Ignore storage errors
+      }
+      const fresh = createFreshState('moon');
+      setSelectedStartPlanet('moon');
+      setPlanetId('moon');
+      setScore(0);
+      setObjectsByPlanet(fresh.objectsByPlanet);
+      setCrystalsByPlanet(fresh.crystalsByPlanet);
+      setLogEntries([]);
+      setAllCompletedShown(false);
+      setMarsUnlockedShown(false);
+      setMarsUnlockedPopupOpen(false);
+      setToast(null);
+      setStoryPopup(null);
+      setTransitionState(null);
+      setSidebarTab('radar');
+      shipRef.current = {
+        x: WORLD_WIDTH / 2,
+        y: WORLD_HEIGHT / 2,
+        vx: 0,
+        vy: 0,
+        angle: -Math.PI / 2,
+        thrusting: false,
+        boosting: false,
+        boostEnergy: 0,
+        hull: 100,
+        invulnTimer: 0,
+      };
+      setShipCoords({ x: WORLD_WIDTH / 2, y: WORLD_HEIGHT / 2 });
+      setBoostEnergy(0);
+      setHull(100);
+      return 'OUT_OF_FUEL';
+    });
+  }, []);
+
+  const handleRetryFromZero = () => {
+    soundEngine.ensureMusicPlaying();
+    const fresh = createFreshState('moon');
+    setSelectedStartPlanet('moon');
+    setPlanetId('moon');
+    setScore(0);
+    setObjectsByPlanet(fresh.objectsByPlanet);
+    setCrystalsByPlanet(fresh.crystalsByPlanet);
+    setLogEntries([]);
+    setAllCompletedShown(false);
+    setMarsUnlockedShown(false);
+    setMarsUnlockedPopupOpen(false);
+    setToast(null);
+    setStoryPopup(null);
+    setTransitionState(null);
+    setSidebarTab('radar');
+    shipRef.current = {
+      x: WORLD_WIDTH / 2,
+      y: WORLD_HEIGHT / 2,
+      vx: 0,
+      vy: 0,
+      angle: -Math.PI / 2,
+      thrusting: false,
+      boosting: false,
+      boostEnergy: 100,
+      hull: 100,
+      invulnTimer: 1.2,
+    };
+    setShipCoords({ x: WORLD_WIDTH / 2, y: WORLD_HEIGHT / 2 });
+    setBoostEnergy(100);
+    setHull(100);
+    setPhase('PLAYING');
+  };
+
+  const handleReturnToEarth = () => {
+    soundEngine.ensureMusicPlaying();
+    soundEngine.playLaunchSequence();
+    setToast(null);
+    setStoryPopup(null);
+    setMarsUnlockedPopupOpen(false);
+    setPhase('EARTH_RETURN_TRANSITION');
+  };
+
+  const handleEarthReturnComplete = useCallback(() => {
+    soundEngine.playArrivalChime();
+    setSidebarTab('radar');
+    setPhase('TITLE_MENU');
+  }, []);
+
+  const handleShipTelemetryUpdate = useCallback(
+    (coords: { x: number; y: number }, energy: number, shipHull: number) => {
+      setShipCoords(coords);
+      setBoostEnergy(energy);
+      setHull(shipHull);
+    },
+    []
+  );
+
+  const handleSwitchPlanet = () => {
+    if (phase !== 'PLAYING' && phase !== 'PAUSED') return;
+    const destination = activePlanet.targetPlanetId;
+    if (destination === 'mars' && !marsUnlocked) return;
+    setMarsUnlockedPopupOpen(false);
+    soundEngine.ensureMusicPlaying();
+    soundEngine.playLaunchSequence();
+    setToast(null);
+    setSidebarTab((tab) => (tab === 'logbook' ? 'radar' : tab));
+    setTransitionState({
+      fromPlanet: planetId,
+      toPlanet: destination,
+      progress: 0,
+      stageLabel: UI_TEXT[lang].stageTakeoff(getPlanetDisplayName(planetId, lang)),
+    });
+    setPhase('TAKEOFF_TRANSITION');
+  };
+
+  const handleLaunchToTargetPlanet = () => {
+    if (!currentMissionComplete || phase !== 'PLAYING') return;
+    handleSwitchPlanet();
+  };
+
+  const handleTransitionProgress = useCallback(
+    (progress: number, stageLabel: string) => {
+      setTransitionState((prev) =>
+        prev ? { ...prev, progress, stageLabel } : null
+      );
+    },
+    []
+  );
+
+  const handleTransitionComplete = useCallback(() => {
+    const nextPlanet = PLANETS[planetId].targetPlanetId;
+    setTransitionState(null);
+    setPlanetId(nextPlanet);
+    shipRef.current = {
+      x: WORLD_WIDTH / 2,
+      y: WORLD_HEIGHT / 2,
+      vx: 0,
+      vy: 0,
+      angle: -Math.PI / 2,
+      thrusting: false,
+      boosting: false,
+      boostEnergy: 100,
+      hull: 100,
+      invulnTimer: 1.0,
+    };
+    setShipCoords({ x: WORLD_WIDTH / 2, y: WORLD_HEIGHT / 2 });
+    setBoostEnergy(100);
+    setHull(100);
+    soundEngine.playArrivalChime();
+    setPhase('PLAYING');
+  }, [planetId]);
+
+  if (phase === 'TITLE_MENU') {
+    return (
+      <MainMenuScreen
+        lang={lang}
+        muted={muted}
+        onToggleLanguage={handleToggleLanguage}
+        onToggleMute={handleToggleMute}
+        onLaunchComplete={() => {
+          setSelectedStartPlanet((prev) =>
+            prev === 'mars' && !marsUnlocked ? 'moon' : prev
+          );
+          setPhase('MENU');
+        }}
+      />
+    );
+  }
+
+  if (phase === 'EARTH_RETURN_TRANSITION') {
+    return (
+      <EarthReturnTransition
+        lang={lang}
+        onComplete={handleEarthReturnComplete}
+      />
+    );
+  }
+
+  return (
+    <div className="h-screen w-screen overflow-hidden flex flex-col crayon-paper-bg text-slate-100">
+      {/* Top Bar Contract: 3 zones in Wax-Crayon Sketchbook Style */}
+      <header className="h-14 shrink-0 border-b-2 border-dashed border-slate-600/75 crayon-paper-bg px-4 lg:px-6 flex items-center justify-between gap-4">
+        {/* Zone 1: Brand Title */}
+        <div className="font-crayon text-2xl font-bold tracking-wide text-slate-50 whitespace-nowrap shrink-0 flex items-center gap-2">
+          <span className="inline-block w-2.5 h-2.5 rounded-full bg-amber-400 border border-amber-100" aria-hidden="true" />
+          <span>{t.brandTitle}</span>
+        </div>
+
+        {/* Zone 2: Clean Live Mission Metrics */}
+        <div className="hidden sm:flex items-center gap-3.5 text-sm font-crayon text-slate-300 whitespace-nowrap overflow-hidden">
+          <span
+            className={`font-bold text-base ${
+              planetId === 'moon' ? 'text-cyan-300' : 'text-amber-300'
+            }`}
+          >
+            {activePlanetName}
+          </span>
+          <span aria-hidden="true">·</span>
+          <span className="font-mono-tabular text-xs text-slate-100">
+            {t.scoreLabel}: {score.toLocaleString(lang === 'en' ? 'en-US' : 'es-MX')}
+          </span>
+          <span aria-hidden="true">·</span>
+          <span className="font-mono-tabular text-xs text-slate-100">
+            {t.rescuedLabel}: {rescuedCountCurrent}/{totalCurrentObjects}
+          </span>
+          <span aria-hidden="true" className="hidden md:inline">
+            ·
+          </span>
+          <span className="hidden md:inline font-mono-tabular text-xs text-slate-300">
+            {t.logbookLabel}: {totalRescued}/{totalObjectsCount}
+          </span>
+        </div>
+
+        {/* Zone 3: Actions */}
+        <div className="flex items-center gap-2 shrink-0">
+          {(phase === 'PLAYING' || phase === 'PAUSED') && (
+            <>
+              <button
+                type="button"
+                disabled={!canSwitchPlanet}
+                onClick={handleSwitchPlanet}
+                className={`crayon-btn inline-flex items-center gap-1.5 px-3 py-1.5 text-sm font-bold whitespace-nowrap shrink-0 ${
+                  !canSwitchPlanet
+                    ? 'crayon-btn-disabled cursor-not-allowed'
+                    : activePlanet.targetPlanetId === 'mars'
+                    ? 'crayon-btn-amber cursor-pointer'
+                    : 'crayon-btn-cyan cursor-pointer'
+                }`}
+                aria-label={
+                  canSwitchPlanet
+                    ? t.switchPlanetAria(targetPlanetName)
+                    : t.switchMarsLockedAria(moonRescuedCount, moonTotal)
+                }
+                title={
+                  canSwitchPlanet
+                    ? t.switchPlanetAria(targetPlanetName)
+                    : t.switchMarsLockedAria(moonRescuedCount, moonTotal)
+                }
+              >
+                {canSwitchPlanet ? (
+                  <Rocket className="w-3.5 h-3.5" />
+                ) : (
+                  <Lock className="w-3.5 h-3.5" />
+                )}
+                <span>
+                  <span className="hidden xl:inline">{t.switchToPrefix} </span>
+                  {targetPlanetName}
+                  {!canSwitchPlanet && (
+                    <span className="ml-1.5 font-mono-tabular text-xs opacity-80">
+                      ({moonRescuedCount}/{moonTotal})
+                    </span>
+                  )}
+                </span>
+              </button>
+
+              <button
+                type="button"
+                onClick={handleTogglePause}
+                className={`crayon-btn inline-flex items-center gap-1.5 px-3 py-1.5 text-sm font-bold whitespace-nowrap shrink-0 cursor-pointer ${
+                  phase === 'PAUSED' ? 'crayon-btn-emerald' : 'crayon-btn-cyan'
+                }`}
+                aria-label={phase === 'PAUSED' ? t.resumeAria : t.pauseAria}
+              >
+                {phase === 'PAUSED' ? (
+                  <Play className="w-3.5 h-3.5" />
+                ) : (
+                  <Pause className="w-3.5 h-3.5" />
+                )}
+                <span className="hidden md:inline">
+                  {phase === 'PAUSED' ? t.resume : t.pause}
+                </span>
+              </button>
+            </>
+          )}
+
+          <button
+            type="button"
+            onClick={handleToggleLanguage}
+            className="crayon-btn crayon-btn-dark inline-flex items-center gap-1.5 px-2.5 py-1.5 text-sm font-bold whitespace-nowrap shrink-0 cursor-pointer"
+            aria-label={t.langSwitchTitle}
+            title={t.langSwitchTitle}
+          >
+            <Languages className="w-3.5 h-3.5" />
+            <span>{t.langSwitchLabel}</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={handleToggleMute}
+            className="crayon-btn crayon-btn-dark inline-flex items-center gap-1.5 px-3 py-1.5 text-sm font-bold whitespace-nowrap shrink-0 cursor-pointer"
+            aria-label={muted ? t.unmuteAria : t.muteAria}
+          >
+            {muted ? (
+              <VolumeX className="w-3.5 h-3.5" />
+            ) : (
+              <Volume2 className="w-3.5 h-3.5" />
+            )}
+            <span className="hidden xl:inline">
+              {muted ? t.muted : t.audio}
+            </span>
+          </button>
+
+          <button
+            type="button"
+            onClick={handleResetMission}
+            className="crayon-btn crayon-btn-amber inline-flex items-center gap-1.5 px-3 py-1.5 text-sm font-bold whitespace-nowrap shrink-0 cursor-pointer"
+            title={t.reset}
+          >
+            <RotateCcw className="w-3.5 h-3.5" />
+            <span className="hidden lg:inline">{t.reset}</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={handleBackToMenu}
+            className="crayon-btn crayon-btn-rose inline-flex items-center gap-1.5 px-3 py-1.5 text-sm font-bold whitespace-nowrap shrink-0 cursor-pointer"
+            aria-label={t.backToMenu}
+            title={t.backToMenu}
+          >
+            <Home className="w-3.5 h-3.5" />
+            <span>{t.backToMenu}</span>
+          </button>
+        </div>
+      </header>
+
+      {/* Main Split Workspace */}
+      <main className="flex-1 min-h-0 flex flex-col lg:flex-row">
+        {/* Left/Center Flight Viewport */}
+        <section className="relative flex-1 min-h-[360px] min-w-0 bg-[#05070B]">
+          <GameCanvas
+            planet={activePlanet}
+            phase={marsUnlockedPopupOpen && phase === 'PLAYING' ? 'PAUSED' : phase}
+            lang={lang}
+            shipRef={shipRef}
+            objects={currentObjects}
+            crystals={currentCrystals}
+            transitionState={transitionState}
+            onCrystalCollect={handleCrystalCollect}
+            onObjectRescued={handleObjectRescued}
+            onShipDamaged={handleShipDamaged}
+            onOutOfFuel={handleOutOfFuel}
+            onShipTelemetryUpdate={handleShipTelemetryUpdate}
+            onTransitionProgress={handleTransitionProgress}
+            onTransitionComplete={handleTransitionComplete}
+          />
+
+          {/* Top-Left Sector, Hull & Gasoline Telemetry (Crayon HUD) */}
+          {phase === 'PLAYING' && (
+            <div className="pointer-events-none absolute top-3 left-3 flex flex-col gap-2">
+              <div
+                className={`crayon-box ${
+                  planetId === 'moon' ? 'crayon-box-moon' : 'crayon-box-mars'
+                } px-3.5 py-2.5 shadow-xl`}
+              >
+                <div className="font-crayon text-base font-bold text-slate-50 leading-tight">
+                  {activePlanetName} · {activePlanetSector}
+                </div>
+                <div className="font-mono-tabular text-[11px] text-slate-300 mt-0.5">
+                  {t.gravity} {activePlanet.gravityLabel} · {t.temp}{' '}
+                  {activePlanet.surfaceTemp}
+                </div>
+                <div className="mt-2 flex items-center gap-2">
+                  <Shield
+                    className={`w-3.5 h-3.5 shrink-0 ${
+                      hull > 50
+                        ? 'text-emerald-400'
+                        : hull > 25
+                        ? 'text-amber-400'
+                        : 'text-red-400'
+                    }`}
+                  />
+                  <div className="crayon-bar-track w-28 h-2.5">
+                    <div
+                      className={`crayon-bar-fill ${
+                        hull > 50
+                          ? 'bg-emerald-400'
+                          : hull > 25
+                          ? 'bg-amber-400'
+                          : 'bg-red-500'
+                      }`}
+                      style={{ width: `${Math.round(hull)}%` }}
+                    />
+                  </div>
+                  <span
+                    className={`font-mono-tabular text-[11px] ${
+                      hull <= 25 ? 'text-red-400 font-semibold' : 'text-slate-200'
+                    }`}
+                  >
+                    {Math.round(hull)}%
+                  </span>
+                </div>
+                <div className="mt-1.5 flex items-center gap-2">
+                  <Fuel
+                    className={`w-3.5 h-3.5 shrink-0 ${
+                      boostEnergy > 50
+                        ? 'text-emerald-400'
+                        : boostEnergy > 25
+                        ? 'text-amber-400'
+                        : 'text-red-400'
+                    }`}
+                  />
+                  <div className="crayon-bar-track w-28 h-2.5">
+                    <div
+                      className={`crayon-bar-fill ${
+                        boostEnergy > 50
+                          ? 'bg-emerald-400'
+                          : boostEnergy > 25
+                          ? 'bg-amber-400'
+                          : 'bg-red-500'
+                      }`}
+                      style={{ width: `${Math.round(boostEnergy)}%` }}
+                    />
+                  </div>
+                  <span
+                    className={`font-mono-tabular text-[11px] ${
+                      boostEnergy <= 25
+                        ? 'text-red-400 font-semibold'
+                        : 'text-slate-200'
+                    }`}
+                  >
+                    {Math.round(boostEnergy)}%
+                  </span>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Non-intrusive Step-by-Step Crayon Mission Guide */}
+          {phase === 'PLAYING' && !marsUnlockedPopupOpen && (
+            <MissionGuideBanner
+              lang={lang}
+              planetId={planetId}
+              planetName={activePlanetName}
+              targetPlanetName={targetPlanetName}
+              activeTargetName={activeTargetName}
+              rescuedCount={rescuedCountCurrent}
+              totalCount={totalCurrentObjects}
+              boostEnergy={boostEnergy}
+              hull={hull}
+              missionComplete={currentMissionComplete}
+            />
+          )}
+
+          {/* Low Gasoline Warning Banner */}
+          {phase === 'PLAYING' && boostEnergy <= 25 && (
+            <div
+              role="status"
+              className="pointer-events-none crayon-box crayon-box-rose absolute top-3 left-1/2 -translate-x-1/2 z-20 flex items-center gap-2 text-rose-100 px-4 py-2 shadow-xl whitespace-nowrap"
+            >
+              <AlertTriangle className="w-4 h-4 text-rose-300 shrink-0" />
+              <Fuel className="w-4 h-4 text-amber-300 shrink-0" />
+              <span className="font-crayon text-base font-bold tracking-wide">
+                {boostEnergy <= 0
+                  ? t.outOfGasBanner
+                  : t.lowGasBanner(Math.round(boostEnergy))}
+              </span>
+            </div>
+          )}
+
+          {/* Incoming Telemetry Data Toast */}
+          {toast &&
+            phase === 'PLAYING' &&
+            (() => {
+              const matchedObj = toast.objectId
+                ? objectsByPlanet[toast.planet].find((o) => o.id === toast.objectId)
+                : undefined;
+              const localized = matchedObj
+                ? getLocalizedObjectCopy(matchedObj, lang)
+                : null;
+              const toastTitle = localized
+                ? `${localized.name} · ${t.dataReceivedSuffix}`
+                : toast.title;
+              const toastSubtitle = localized
+                ? localized.transmissionTitle
+                : toast.subtitle;
+              const toastReading = localized
+                ? localized.telemetryReading
+                : toast.reading;
+
+              return (
+                <div className="crayon-box crayon-box-emerald absolute top-3 right-3 max-w-sm p-3.5 shadow-xl">
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="flex items-center gap-2 font-crayon text-sm font-bold text-emerald-300">
+                      <CheckCircle2 className="w-4 h-4 shrink-0" />
+                      <span>{toastTitle}</span>
+                    </div>
+                    <span className="font-mono-tabular text-xs font-semibold text-emerald-300 shrink-0">
+                      +{toast.points} pts
+                    </span>
+                  </div>
+                  <div className="font-crayon text-base font-bold text-slate-100 mt-1">
+                    {toastSubtitle}
+                  </div>
+                  <div className="font-mono-tabular text-[11px] text-slate-300 mt-1">
+                    {toastReading}
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      handleSelectSidebarTab('logbook');
+                      setToast(null);
+                    }}
+                    className="crayon-btn crayon-btn-cyan mt-2.5 inline-flex items-center px-3.5 py-1 text-sm font-bold whitespace-nowrap cursor-pointer"
+                  >
+                    {t.viewInLogbook}
+                  </button>
+                </div>
+              );
+            })()}
+
+          {/* Bottom-Left Controls Hint */}
+          {phase === 'PLAYING' && !currentMissionComplete && (
+            <div className="pointer-events-none hidden sm:block crayon-box crayon-box-slate absolute bottom-3 left-3 px-3.5 py-1.5 font-crayon text-sm text-slate-200">
+              {t.controlsHint}
+            </div>
+          )}
+
+          {/* Floating In-Viewport Probe Radar Minimap */}
+          {phase === 'PLAYING' && (
+            <ProbeMinimap
+              planet={activePlanet}
+              lang={lang}
+              shipRef={shipRef}
+              objects={currentObjects}
+              crystals={currentCrystals}
+            />
+          )}
+
+          {/* Mission Complete -> Planetary Propulsion Launch CTA (kept clear of bottom-right minimap) */}
+          {phase === 'PLAYING' && currentMissionComplete && (
+            <div className="crayon-box crayon-box-slate absolute bottom-3 left-3 w-[calc(100%-224px)] max-w-md p-3.5 flex flex-col sm:flex-row items-center justify-between gap-3 shadow-2xl">
+              <div className="min-w-0 text-center sm:text-left">
+                <div className="font-crayon text-base font-bold text-emerald-300">
+                  {t.missionCompleted(activePlanetName, totalCurrentObjects)}
+                </div>
+                <div className="font-crayon text-sm text-slate-200 mt-0.5">
+                  {t.thrustersReady(targetPlanetName)}
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={handleLaunchToTargetPlanet}
+                className={`crayon-btn inline-flex items-center gap-2 px-4 py-2 text-sm font-bold whitespace-nowrap shrink-0 cursor-pointer ${
+                  activePlanet.targetPlanetId === 'mars'
+                    ? 'crayon-btn-amber'
+                    : 'crayon-btn-cyan'
+                }`}
+              >
+                <Rocket className="w-4 h-4" />
+                <span>{t.launchTo(targetPlanetName)}</span>
+              </button>
+            </div>
+          )}
+
+          {/* Takeoff Transition Telemetry Overlay */}
+          {phase === 'TAKEOFF_TRANSITION' && transitionState && (
+            <div className="pointer-events-none absolute inset-x-0 bottom-6 flex justify-center px-4">
+              <div className="crayon-box crayon-box-slate w-full max-w-md p-4 shadow-2xl">
+                <div className="flex items-center justify-between text-sm mb-2">
+                  <span className="font-crayon text-lg font-bold text-slate-100">
+                    {transitionState.stageLabel}
+                  </span>
+                  <span className="font-mono-tabular text-xs font-bold text-amber-300">
+                    {Math.round(transitionState.progress * 100)}%
+                  </span>
+                </div>
+                <div className="crayon-bar-track w-full h-3">
+                  <div
+                    className="crayon-bar-fill bg-gradient-to-r from-cyan-400 to-amber-400"
+                    style={{
+                      width: `${Math.round(transitionState.progress * 100)}%`,
+                    }}
+                  />
+                </div>
+                <div className="flex items-center justify-between text-xs text-slate-300 mt-2 font-mono-tabular">
+                  <span>
+                    {t.origin}: {getPlanetDisplayName(transitionState.fromPlanet, lang)}
+                  </span>
+                  <span>
+                    {t.destination}: {getPlanetDisplayName(transitionState.toPlanet, lang)}
+                  </span>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Destination Selector Overlay (Moon & Mars with Crayon Artwork) */}
+          {phase === 'MENU' && (
+            <div className="absolute inset-0 bg-[#070A12]/88 backdrop-blur-xs flex items-center justify-center p-4 overflow-y-auto custom-scrollbar">
+              <div className="crayon-box crayon-box-slate w-full max-w-xl p-6 flex flex-col gap-4 shadow-2xl">
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <div className="font-crayon text-sm font-bold text-cyan-300">
+                      {t.menuKicker}
+                    </div>
+                    <h1 className="font-crayon text-3xl sm:text-4xl font-bold text-slate-50 mt-0.5 text-balance">
+                      {t.brandTitle}
+                    </h1>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={handleBackToMenu}
+                    className="crayon-btn crayon-btn-dark inline-flex items-center gap-1.5 px-3 py-1.5 text-sm font-bold whitespace-nowrap shrink-0 cursor-pointer"
+                  >
+                    <ArrowLeft className="w-3.5 h-3.5" />
+                    <span>{t.backToTitleMenu}</span>
+                  </button>
+                </div>
+
+                <p className="font-crayon text-base text-slate-200 leading-snug">
+                  {t.menuDesc}
+                </p>
+
+                {/* Destination Planet Selector (Moon & Mars) */}
+                <div className="flex flex-col gap-2.5">
+                  <div className="font-crayon text-sm font-bold text-slate-300">
+                    {t.chooseStart}
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
+                    <button
+                      type="button"
+                      onClick={() => setSelectedStartPlanet('moon')}
+                      className={`crayon-btn p-3.5 text-left cursor-pointer flex items-center gap-3 ${
+                        selectedStartPlanet === 'moon'
+                          ? 'crayon-btn-cyan'
+                          : 'crayon-btn-dark'
+                      }`}
+                    >
+                      <div className="w-14 h-14 rounded-full overflow-hidden bg-black shrink-0 border-2 border-slate-200/50 shadow-md">
+                        <img
+                          src={PLANETS.moon.surfaceImageUrl}
+                          alt={getPlanetDisplayName('moon', lang)}
+                          className="w-full h-full object-cover scale-105"
+                        />
+                      </div>
+                      <div className="min-w-0">
+                        <div className="font-crayon text-xl font-bold">
+                          {getPlanetDisplayName('moon', lang)}
+                        </div>
+                        <div
+                          className={`font-crayon text-xs mt-0.5 ${
+                            selectedStartPlanet === 'moon'
+                              ? 'text-slate-900 font-bold'
+                              : 'text-slate-300'
+                          }`}
+                        >
+                          {getPlanetSectorName('moon', lang)} · {moonRescuedCount}/{moonTotal}
+                        </div>
+                      </div>
+                    </button>
+
+                    <button
+                      type="button"
+                      disabled={!marsUnlocked}
+                      onClick={() => {
+                        if (marsUnlocked) setSelectedStartPlanet('mars');
+                      }}
+                      className={`crayon-btn p-3.5 text-left flex items-center gap-3 ${
+                        !marsUnlocked
+                          ? 'crayon-btn-disabled cursor-not-allowed opacity-85'
+                          : selectedStartPlanet === 'mars'
+                          ? 'crayon-btn-amber cursor-pointer'
+                          : 'crayon-btn-dark cursor-pointer'
+                      }`}
+                      aria-label={
+                        marsUnlocked
+                          ? getPlanetDisplayName('mars', lang)
+                          : t.switchMarsLockedAria(moonRescuedCount, moonTotal)
+                      }
+                      title={
+                        marsUnlocked
+                          ? getPlanetDisplayName('mars', lang)
+                          : t.marsLockedMenuDesc(moonTotal)
+                      }
+                    >
+                      <div
+                        className={`w-14 h-14 rounded-full overflow-hidden bg-black shrink-0 border-2 border-amber-200/40 shadow-md ${
+                          !marsUnlocked ? 'grayscale opacity-50' : ''
+                        }`}
+                      >
+                        <img
+                          src={PLANETS.mars.surfaceImageUrl}
+                          alt={getPlanetDisplayName('mars', lang)}
+                          className="w-full h-full object-cover scale-105"
+                        />
+                      </div>
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center justify-between gap-2">
+                          <span
+                            className={`font-crayon text-xl font-bold ${
+                              !marsUnlocked
+                                ? 'text-slate-400'
+                                : selectedStartPlanet === 'mars'
+                                ? 'text-slate-950'
+                                : 'text-slate-100'
+                            }`}
+                          >
+                            {getPlanetDisplayName('mars', lang)}
+                          </span>
+                          <span
+                            className={`inline-flex items-center gap-1 text-xs font-crayon font-bold shrink-0 ${
+                              !marsUnlocked
+                                ? 'text-amber-400/90'
+                                : selectedStartPlanet === 'mars'
+                                ? 'text-amber-950'
+                                : 'text-emerald-300'
+                            }`}
+                          >
+                            {marsUnlocked ? (
+                              <Unlock className="w-3.5 h-3.5 shrink-0" />
+                            ) : (
+                              <Lock className="w-3.5 h-3.5 shrink-0" />
+                            )}
+                            <span>
+                              {marsUnlocked ? t.marsUnlockedBadge : t.marsLockedBadge}
+                            </span>
+                          </span>
+                        </div>
+                        <div
+                          className={`font-crayon text-xs mt-0.5 leading-snug ${
+                            !marsUnlocked
+                              ? 'text-slate-400'
+                              : selectedStartPlanet === 'mars'
+                              ? 'text-slate-900 font-bold'
+                              : 'text-slate-300'
+                          }`}
+                        >
+                          {marsUnlocked
+                            ? `${getPlanetSectorName('mars', lang)} · ${objectsByPlanet.mars.filter((o) => o.discovered).length}/${marsTotal}`
+                            : t.marsLockedMenuDesc(moonTotal)}
+                        </div>
+                      </div>
+                    </button>
+                  </div>
+                </div>
+
+                <div className="font-crayon text-sm text-slate-300 crayon-divider pt-3 flex flex-wrap gap-x-3 gap-y-1">
+                  <span>{t.menuControls[0]}</span>
+                  <span aria-hidden="true">·</span>
+                  <span>{t.menuControls[1]}</span>
+                  <span aria-hidden="true">·</span>
+                  <span>{t.menuControls[2]}</span>
+                </div>
+
+                <div className="flex items-center gap-3">
+                  <button
+                    type="button"
+                    onClick={() => handleStartMission(selectedStartPlanet)}
+                    className={`crayon-btn flex-1 py-3 px-4 font-bold text-lg cursor-pointer inline-flex items-center justify-center gap-2 ${
+                      selectedStartPlanet === 'mars' && marsUnlocked
+                        ? 'crayon-btn-amber'
+                        : 'crayon-btn-cyan'
+                    }`}
+                  >
+                    <Rocket className="w-5 h-5" />
+                    <span>
+                      {logEntries.length > 0 ? t.continueMission : t.startMission}
+                    </span>
+                  </button>
+                  {logEntries.length > 0 && (
+                    <button
+                      type="button"
+                      onClick={handleResetMission}
+                      className="crayon-btn crayon-btn-dark py-3 px-4 font-bold text-base cursor-pointer inline-flex items-center justify-center gap-1.5"
+                      title={t.resetMission}
+                    >
+                      <RotateCcw className="w-4 h-4" />
+                      <span>{t.reset}</span>
+                    </button>
+                  )}
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Story / Archival Discovery Popup (pure transparent image + Salir/Exit button) */}
+          {phase === 'STORY_POPUP' && storyPopup && (
+            <StoryPopupModal
+              objectId={storyPopup.objectId}
+              imageUrl={storyPopup.imageUrl}
+              alt={storyPopup.title}
+              lang={lang}
+              onExit={handleContinueFromStory}
+            />
+          )}
+
+          {/* Crayon Mars Unlocked Popup */}
+          {phase === 'PLAYING' && marsUnlockedPopupOpen && (
+            <div className="absolute inset-0 z-30 bg-[#07090E]/75 backdrop-blur-xs flex items-center justify-center p-4">
+              <div className="crayon-box crayon-box-mars w-full max-w-md p-6 flex flex-col gap-4 shadow-2xl">
+                <div>
+                  <div className="flex items-center gap-2 text-xs font-semibold text-amber-300">
+                    <Unlock className="w-4 h-4 shrink-0" />
+                    <span>{t.marsUnlockedKicker(moonTotal)}</span>
+                  </div>
+                  <h2 className="font-crayon text-3xl font-bold text-amber-200 mt-1">
+                    {t.marsUnlockedTitle}
+                  </h2>
+                  <p className="text-sm text-slate-200 leading-relaxed mt-1.5">
+                    {t.marsUnlockedDesc}
+                  </p>
+                </div>
+
+                <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-3 pt-1">
+                  <button
+                    type="button"
+                    onClick={handleLaunchToTargetPlanet}
+                    className="crayon-btn crayon-btn-amber flex-1 inline-flex items-center justify-center gap-2 py-2.5 px-4 text-sm font-bold cursor-pointer"
+                  >
+                    <Rocket className="w-4 h-4" />
+                    <span>{t.launchTo(getPlanetDisplayName('mars', lang))}</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleDismissMarsUnlocked}
+                    className="crayon-btn crayon-btn-dark py-2.5 px-4 text-sm font-bold cursor-pointer"
+                  >
+                    {t.stayOnMoon}
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Crayon Pause Overlay (manual pause or auto-pause when reading Bitácora) */}
+          {phase === 'PAUSED' && (
+            <div className="absolute inset-0 bg-[#07090E]/75 backdrop-blur-xs flex items-center justify-center p-4">
+              <div className="crayon-box crayon-box-slate w-full max-w-md p-6 flex flex-col gap-4 shadow-2xl">
+                <div>
+                  <div className="flex items-center gap-2 font-crayon text-sm font-bold text-sky-300">
+                    <Pause className="w-4 h-4 shrink-0" />
+                    <span>
+                      {sidebarTab === 'logbook'
+                        ? t.pausedFromLogbook
+                        : t.pausedManual}
+                    </span>
+                  </div>
+                  <h2 className="font-crayon text-3xl font-bold text-slate-50 mt-1">
+                    {t.pausedTitle}
+                  </h2>
+                  <p className="font-crayon text-base text-slate-200 leading-snug mt-1.5">
+                    {sidebarTab === 'logbook'
+                      ? t.pausedLogbookDesc
+                      : t.pausedManualDesc}
+                  </p>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2.5 pt-1">
+                  <button
+                    type="button"
+                    onClick={handleTogglePause}
+                    className="crayon-btn crayon-btn-emerald flex-1 inline-flex items-center justify-center gap-2 py-2.5 px-4 text-base font-bold cursor-pointer"
+                  >
+                    <Play className="w-4 h-4" />
+                    <span>{t.resume}</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleResetMission}
+                    className="crayon-btn crayon-btn-dark py-2.5 px-3.5 text-sm font-bold cursor-pointer"
+                  >
+                    {t.resetMission}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleBackToMenu}
+                    className="crayon-btn crayon-btn-rose w-full inline-flex items-center justify-center gap-2 py-2 px-4 text-sm font-bold cursor-pointer"
+                  >
+                    <Home className="w-4 h-4" />
+                    <span>{t.backToMenu}</span>
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Hull Critical / Emergency Repair Modal */}
+          {phase === 'SHIP_DESTROYED' && (
+            <div className="absolute inset-0 bg-[#07090E]/85 backdrop-blur-xs flex items-center justify-center p-4">
+              <div className="crayon-box crayon-box-rose w-full max-w-md p-6 flex flex-col gap-4 shadow-2xl">
+                <div>
+                  <div className="flex items-center gap-2 font-crayon text-sm font-bold text-rose-300">
+                    <AlertTriangle className="w-4 h-4 shrink-0" />
+                    <span>{t.hullKicker}</span>
+                  </div>
+                  <h2 className="font-crayon text-3xl font-bold text-slate-50 mt-1">
+                    {t.hullTitle}
+                  </h2>
+                  <p className="font-crayon text-base text-slate-200 leading-snug mt-2">
+                    {t.hullDesc}
+                  </p>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2.5 pt-1">
+                  <button
+                    type="button"
+                    onClick={handleRepairAndRespawn}
+                    className="crayon-btn crayon-btn-cyan flex-1 py-2.5 px-4 text-base font-bold cursor-pointer"
+                  >
+                    {t.repairAndRelaunch}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleResetMission}
+                    className="crayon-btn crayon-btn-dark py-2.5 px-3.5 text-sm font-bold cursor-pointer"
+                  >
+                    {t.resetMission}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleBackToMenu}
+                    className="crayon-btn crayon-btn-rose w-full inline-flex items-center justify-center gap-2 py-2 px-4 text-sm font-bold cursor-pointer"
+                  >
+                    <Home className="w-4 h-4" />
+                    <span>{t.backToMenu}</span>
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Out of Fuel Game-Over Modal (full reset to zero — no regenerate) */}
+          {phase === 'OUT_OF_FUEL' && (
+            <div className="absolute inset-0 z-30 bg-[#07090E]/88 backdrop-blur-xs flex items-center justify-center p-4">
+              <div className="crayon-box crayon-box-rose w-full max-w-md p-6 flex flex-col gap-4 shadow-2xl">
+                <div>
+                  <div className="flex items-center gap-2 font-crayon text-sm font-bold text-rose-300">
+                    <Fuel className="w-4 h-4 shrink-0" />
+                    <span>{t.fuelKicker}</span>
+                  </div>
+                  <h2 className="font-crayon text-3xl font-bold text-slate-50 mt-1">
+                    {t.fuelTitle}
+                  </h2>
+                  <p className="font-crayon text-base text-slate-200 leading-snug mt-2">
+                    {t.fuelDesc}
+                  </p>
+                </div>
+
+                <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2.5 pt-1">
+                  <button
+                    type="button"
+                    onClick={handleRetryFromZero}
+                    className="crayon-btn crayon-btn-amber flex-1 inline-flex items-center justify-center gap-2 py-2.5 px-4 text-base font-bold cursor-pointer"
+                  >
+                    <RotateCcw className="w-4 h-4" />
+                    <span>{t.retryFromZero}</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleBackToMenu}
+                    className="crayon-btn crayon-btn-dark flex-1 inline-flex items-center justify-center gap-2 py-2.5 px-4 text-base font-bold cursor-pointer"
+                  >
+                    <Home className="w-4 h-4" />
+                    <span>{t.backToMenu}</span>
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* All Objects Rescued Celebration Modal -> Return to Earth */}
+          {phase === 'ALL_COMPLETED' && (
+            <div className="absolute inset-0 z-30 bg-[#07090E]/88 backdrop-blur-xs flex items-center justify-center p-4">
+              <div className="crayon-box crayon-box-emerald w-full max-w-md p-6 flex flex-col gap-4 shadow-2xl">
+                <div>
+                  <div className="font-crayon text-sm font-bold text-emerald-300">
+                    {t.allKicker}
+                  </div>
+                  <h2 className="font-crayon text-3xl font-bold text-slate-50 leading-tight mt-1">
+                    {t.allTitle}
+                  </h2>
+                  <p className="font-crayon text-base text-slate-200 leading-snug mt-2">
+                    {t.allDesc(moonTotal, marsTotal)}
+                  </p>
+                </div>
+
+                <div className="crayon-box crayon-box-slate grid grid-cols-2 gap-3 p-3.5">
+                  <div>
+                    <div className="font-crayon text-sm text-slate-300">{t.finalScore}</div>
+                    <div className="font-mono-tabular text-xl font-bold text-slate-50 mt-0.5">
+                      {score.toLocaleString(lang === 'en' ? 'en-US' : 'es-MX')}
+                    </div>
+                  </div>
+                  <div>
+                    <div className="font-crayon text-sm text-slate-300">{t.logbookLabel}</div>
+                    <div className="font-mono-tabular text-xl font-bold text-emerald-300 mt-0.5">
+                      {totalRescued}/{totalObjectsCount}
+                    </div>
+                  </div>
+                </div>
+
+                <div className="flex flex-col gap-2.5 pt-1">
+                  <button
+                    type="button"
+                    onClick={handleReturnToEarth}
+                    className="crayon-btn crayon-btn-emerald w-full inline-flex items-center justify-center gap-2.5 py-3 px-4 text-lg font-bold cursor-pointer"
+                  >
+                    <Rocket className="w-5 h-5" />
+                    <span>{t.returnToEarth}</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setPhase('PLAYING')}
+                    className="crayon-btn crayon-btn-dark w-full py-2 px-4 text-sm font-bold cursor-pointer"
+                  >
+                    {t.keepExploring}
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+        </section>
+
+        {/* Right Tactical Console: Radar & Mission Logbook (Crayon Sketchbook Sidebar) */}
+        <aside className="w-full lg:w-[390px] xl:w-[410px] shrink-0 border-t-2 lg:border-t-0 lg:border-l-2 border-dashed border-slate-600/75 crayon-paper-bg flex flex-col max-h-[44vh] lg:max-h-none min-h-0">
+          {/* Console Segmented Tabs */}
+          <div className="p-3 border-b-2 border-dashed border-slate-700/70 shrink-0">
+            <div className="crayon-box crayon-box-slate flex items-center gap-2 p-1.5">
+              <button
+                type="button"
+                onClick={() => handleSelectSidebarTab('radar')}
+                className={`crayon-btn flex-1 inline-flex items-center justify-center gap-2 px-3 py-2 text-sm font-bold whitespace-nowrap shrink-0 cursor-pointer ${
+                  sidebarTab === 'radar'
+                    ? planetId === 'moon'
+                      ? 'crayon-btn-cyan'
+                      : 'crayon-btn-amber'
+                    : 'crayon-btn-ghost'
+                }`}
+              >
+                <Radio className="w-3.5 h-3.5" />
+                <span>{t.tabRadar} ({rescuedCountCurrent}/{totalCurrentObjects})</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => handleSelectSidebarTab('logbook')}
+                className={`crayon-btn flex-1 inline-flex items-center justify-center gap-2 px-3 py-2 text-sm font-bold whitespace-nowrap shrink-0 cursor-pointer ${
+                  sidebarTab === 'logbook'
+                    ? 'crayon-btn-emerald'
+                    : 'crayon-btn-ghost'
+                }`}
+              >
+                <BookOpen className="w-3.5 h-3.5" />
+                <span>{t.tabLogbook} ({logEntries.length})</span>
+              </button>
+            </div>
+          </div>
+
+          {/* Active Console Body */}
+          <div className="flex-1 min-h-0 p-4 overflow-y-auto custom-scrollbar flex flex-col gap-4">
+            {sidebarTab === 'radar' ? (
+              <>
+                <RadarPanel
+                  planet={activePlanet}
+                  lang={lang}
+                  shipRef={shipRef}
+                  objects={currentObjects}
+                  crystals={currentCrystals}
+                  shipCoords={shipCoords}
+                />
+
+                {/* Interplanetary Launch Module inside console */}
+                <div className="crayon-box crayon-box-slate p-3.5 flex flex-col gap-2.5 mt-auto">
+                  <div className="flex items-center justify-between text-xs">
+                    <span className="font-crayon text-base font-bold text-slate-100">
+                      {t.interplanetaryPropulsion}
+                    </span>
+                    <span
+                      className={`font-crayon text-xs font-bold ${
+                        currentMissionComplete
+                          ? 'text-emerald-300'
+                          : 'text-slate-400'
+                      }`}
+                    >
+                      {currentMissionComplete ? t.unlocked : t.locked}
+                    </span>
+                  </div>
+
+                  <p className="text-xs text-slate-300 leading-relaxed">
+                    {currentMissionComplete
+                      ? t.launchUnlockedDesc(activePlanetName, targetPlanetName)
+                      : t.launchLockedDesc(activePlanetName, targetPlanetName, totalCurrentObjects)}
+                  </p>
+
+                  <button
+                    type="button"
+                    disabled={!currentMissionComplete || phase !== 'PLAYING'}
+                    onClick={handleLaunchToTargetPlanet}
+                    className={`crayon-btn w-full inline-flex items-center justify-center gap-2 py-2.5 px-4 text-sm font-bold whitespace-nowrap ${
+                      currentMissionComplete && phase === 'PLAYING'
+                        ? activePlanet.targetPlanetId === 'mars'
+                          ? 'crayon-btn-amber cursor-pointer'
+                          : 'crayon-btn-cyan cursor-pointer'
+                        : 'crayon-btn-disabled cursor-not-allowed'
+                    }`}
+                  >
+                    <Rocket className="w-4 h-4" />
+                    <span>{t.launchTo(targetPlanetName)}</span>
+                  </button>
+                </div>
+              </>
+            ) : (
+              <LogbookPanel
+                activePlanetId={planetId}
+                lang={lang}
+                objectsByPlanet={objectsByPlanet}
+                entries={logEntries}
+                onOpenStoryImage={handleOpenStoryFromLogbook}
+              />
+            )}
+          </div>
+        </aside>
+      </main>
+    </div>
+  );
+}
